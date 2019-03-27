@@ -37,6 +37,7 @@ async function recordCanvas(
 
   let first = true;
   let last = false;
+  let numFrames = 0;
 
   recorder.start();
 
@@ -44,6 +45,7 @@ async function recordCanvas(
   await new Promise(requestAnimationFrame);
   while (!last) {
     last = renderNextFrame();
+    numFrames++;
 
     if (first) {
       first = false;
@@ -61,53 +63,98 @@ async function recordCanvas(
 
   await recorderStop;
 
-  const buffer = await fixFPS(new Blob(chunks), fps);
+  const newChunks = await fixFPS(
+    await readBlob(new Blob(chunks)),
+    fps,
+    numFrames
+  );
 
-  const out = new Blob([buffer], { type: mediaType });
+  const out = new Blob(newChunks, { type: mediaType });
 
   return out;
 }
 
+// prettier-ignore
+const UNKNOWN_SIZE = new Uint8Array([ 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff ]);
+const INT32_SIZE = new Uint8Array([0x84]);
 /**
- * @param {Blob} blob
+ * @param {ArrayBuffer} buffer
  * @param {number} fps
- * @returns {Promise<ArrayBuffer>}
+ * @param {number} numFrames
+ * @returns {Promise<BlobPart[]>}
  * */
-async function fixFPS(blob, fps) {
-  const reader = new FileReader();
-  reader.readAsArrayBuffer(blob);
-
-  await new Promise(res => {
-    reader.onload = res;
-  });
-
-  const result = reader.result;
-  if (typeof result === "string") throw "unreachable";
-  const buffer = result;
-
+async function fixFPS(buffer, fps, numFrames) {
+  /** @type {BlobPart[]} */
+  const chunks = [];
   let frameIndex = 0;
+  let clusterFrameIndex = 0;
+  let timecodeScaleSize;
 
-  const containerElements = ["Segment", "Info", "Cluster"];
-
-  /** @type {Record<string, (data: DataView) => void>} */
+  /** @type {Record<string, (el: {
+    tag: string,
+    tagBytes: DataView,
+    sizeBytes: DataView,
+    start: number,
+    length: number
+  }) => void>} */
   const elementHandlers = {
-    TimecodeScale: data => {
-      // should be 1000000 by default
-      const scale = 1000000;
+    Info: el => {
+      let infoSize = el.length;
+      const infoSizeBytes = new DataView(new ArrayBuffer(5));
+      infoSizeBytes.setUint8(0, 0x08);
 
-      data.setUint8(2, scale & 0xff);
-      data.setUint8(1, (scale >> 8) & 0xff);
-      data.setUint8(0, scale >> 16);
+      chunks.push(el.tagBytes, infoSizeBytes);
+
+      parse(el.start, el.length);
+
+      infoSize += 4 - timecodeScaleSize;
+
+      // add duration
+      const duration = (numFrames / fps) * 1000;
+      const durationBytes = new DataView(new ArrayBuffer(8));
+      durationBytes.setFloat64(0, duration);
+      chunks.push(new Uint8Array([0x44, 0x89, 0x88]), durationBytes);
+      infoSize += 3 + 8;
+
+      infoSizeBytes.setUint32(1, infoSize);
     },
-    Timecode: data => {
-      // cluster timecode should be 0 by default
-      data.setUint8(0, 0);
+    Segment: el => {
+      chunks.push(el.tagBytes, UNKNOWN_SIZE);
+      parse(el.start, el.length);
     },
-    SimpleBlock: data => {
-      // rewrite block timecode to fix fps
-      data.setUint16(1, (frameIndex * 1000) / fps);
+    Cluster: el => {
+      frameIndex = 0;
+
+      chunks.push(el.tagBytes, UNKNOWN_SIZE);
+      parse(el.start, el.length);
+    },
+    TimecodeScale: el => {
+      // should be 1000000 by default but make sure
+      timecodeScaleSize = el.length;
+      const timecodeScale = new DataView(new ArrayBuffer(4));
+      timecodeScale.setUint32(0, 1000000);
+
+      chunks.push(el.tagBytes, INT32_SIZE, timecodeScale);
+    },
+    Duration: el => {
+      // ignore
+    },
+    Timecode: el => {
+      // rewrite cluster timecode
+      const timecode = new DataView(new ArrayBuffer(4));
+      timecode.setUint32(0, (clusterFrameIndex * 1000) / fps);
+      chunks.push(el.tagBytes, INT32_SIZE, timecode);
+    },
+    SimpleBlock: el => {
+      const data = new DataView(buffer, el.start, el.length);
+
+      // rewrite block timecode
+      data.setInt16(1, (frameIndex * 1000) / fps, false);
 
       frameIndex++;
+      clusterFrameIndex++;
+
+      chunks.push(el.tagBytes, el.sizeBytes, data);
     }
   };
 
@@ -119,17 +166,37 @@ async function fixFPS(blob, fps) {
    */
   function parse(start, length) {
     const reader = readEBML(buffer, start, length);
-    for (let { element, start, length } of reader) {
-      if (containerElements.includes(element)) {
-        parse(start, length);
-      }
-      if (element in elementHandlers) {
-        elementHandlers[element](new DataView(buffer, start, length));
+    for (let el of reader) {
+      if (el.tag in elementHandlers) {
+        elementHandlers[el.tag](el);
+      } else {
+        chunks.push(
+          el.tagBytes,
+          el.sizeBytes,
+          new DataView(buffer, el.start, el.length)
+        );
       }
     }
   }
 
-  return buffer;
+  return chunks;
+}
+
+/**
+ * @param {Blob} blob
+ */
+async function readBlob(blob) {
+  const reader = new FileReader();
+  reader.readAsArrayBuffer(blob);
+
+  await new Promise(resolve => {
+    reader.onload = resolve;
+  });
+
+  const result = reader.result;
+  if (typeof result === "string") throw "unreachable";
+
+  return result;
 }
 
 /* https://www.matroska.org/technical/specs/index.html */
@@ -145,10 +212,11 @@ function* readEBML(buffer, start, length) {
   let cursor = 0;
   while (cursor < data.byteLength) {
     const idLength = readVintLength(data, cursor);
-    const id = readVintTag(data, idLength, cursor);
+    const id = readVint(data, idLength, cursor);
 
-    out.element = schema.get(id);
-    if (!out.element) {
+    out.tag = schema.get(id);
+    out.tagBytes = new DataView(buffer, start + cursor, idLength);
+    if (!out.tag) {
       // debugger;
       throw new Error(`unknown element: ${id}`);
     }
@@ -156,6 +224,7 @@ function* readEBML(buffer, start, length) {
 
     const sizeLength = readVintLength(data, cursor);
     const size = readVintValue(data, sizeLength, cursor);
+    out.sizeBytes = new DataView(buffer, start + cursor, sizeLength);
 
     cursor += sizeLength;
 
@@ -192,7 +261,8 @@ function readVintValue(data, length, start) {
     value *= 1 << 8;
     value += data.getUint8(start + i);
   }
-  if (value === 2 ** (length * 7) - 1) {
+  if (value > Number.MAX_SAFE_INTEGER) {
+    // value greater than this is effectively unknown in js
     value = -1;
   }
   return value;
@@ -202,7 +272,7 @@ function readVintValue(data, length, start) {
  * @param {number} length
  * @param {number} start
  */
-function readVintTag(data, length, start) {
+function readVint(data, length, start) {
   let value = data.getUint8(start);
   for (let i = 1; i < length; i++) {
     value *= 1 << 8;
