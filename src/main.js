@@ -9,21 +9,23 @@ ctx.textBaseline = "middle";
 const N = 5 * 60;
 let t = 0;
 function draw() {
-  const x = 20 * Math.cos((2 * Math.PI * t) / N);
-  const y = 20 * Math.sin((2 * Math.PI * t) / N);
+  const x = 50 * Math.cos((2 * Math.PI * t) / N);
+  const y = 50 * Math.sin((2 * Math.PI * t) / N);
   ctx.fillStyle = "white";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.fillStyle = "black";
   ctx.fillRect(canvas.width / 2 + x - 5, canvas.height / 2 + y - 5, 10, 10);
   t++;
 
-  let s = (t < 10 ? "0" : "") + t.toString();
+  let s = (t < 100 ? (t < 10 ? "00" : "0") : "") + t.toString();
   ctx.fillText(s, canvas.width / 2, canvas.height / 2);
 
-  // simulate slow rendering
-  // for (let x = 0; x < 100000000; x++) {
-  //   void Math.pow(x, t);
-  // }
+  // simulate random slow rendering
+  if (Math.random() < 0.1) {
+    for (let x = 0; x < 100000000; x++) {
+      void Math.pow(x, t);
+    }
+  }
 
   return t >= N;
 }
@@ -44,10 +46,9 @@ recordCanvas(canvas, draw, {
 
     container.appendChild(document.createElement("br"));
 
-    const b = container.appendChild(document.createElement("a"));
-    b.textContent = "Preview";
-    b.href = url;
-    b.target = "_blank";
+    const b = container.appendChild(document.createElement("video"));
+    b.src = url;
+    b.controls = true;
   })
   .catch(e => {
     console.error(e);
