@@ -6,7 +6,7 @@ ctx.font = "24px monospace";
 ctx.textAlign = "center";
 ctx.textBaseline = "middle";
 
-const N = 10;
+const N = 5 * 60;
 let t = 0;
 function draw() {
   const x = 20 * Math.cos((2 * Math.PI * t) / N);
