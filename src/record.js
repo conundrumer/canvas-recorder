@@ -142,14 +142,14 @@ async function fixFPS(buffer, fps, numFrames) {
     Timecode: el => {
       // rewrite cluster timecode
       const timecode = new DataView(new ArrayBuffer(4));
-      timecode.setUint32(0, (clusterFrameIndex * 1000) / fps);
+      timecode.setUint32(0, Math.round((clusterFrameIndex * 1000) / fps));
       chunks.push(el.tagBytes, INT32_SIZE, timecode);
     },
     SimpleBlock: el => {
       const data = new DataView(buffer, el.start, el.length);
 
       // rewrite block timecode
-      data.setInt16(1, (frameIndex * 1000) / fps, false);
+      data.setInt16(1, Math.round((frameIndex * 1000) / fps), false);
 
       frameIndex++;
       clusterFrameIndex++;
