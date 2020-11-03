@@ -7,14 +7,17 @@ export default recordCanvas;
  */
 async function recordCanvas(
   canvas,
-  renderNextFrame,
-  { mediaType = "video/webm", fps = 60, bitsPerSecond = undefined } = {}
+  renderNextFrame, // vp8 is always compressed for some reason in chrome 81, use vp9
+  { mediaType = "video/webm;codecs=vp9", fps = 60, bitsPerSecond = undefined } = {}
 ) {
   if (!window.MediaRecorder) {
     throw new Error("MediaRecorder not available");
   }
   if (!MediaRecorder.isTypeSupported(mediaType)) {
-    throw new Error(`Not supported: ${mediaType}`);
+    mediaType = "video/webm" // fallback
+    if (!MediaRecorder.isTypeSupported(mediaType)) {
+      throw new Error(`Not supported: ${mediaType}`);
+    }
   }
 
   // @ts-ignore
@@ -25,10 +28,15 @@ async function recordCanvas(
   });
   const chunks = [];
 
+  let dataAvailablePromiseCb
+  let dataAvailablePromise = new Promise(resolve => {
+    dataAvailablePromiseCb = resolve
+  })
   recorder.ondataavailable = e => {
     if (e.data.size > 0) {
       chunks.push(e.data);
     }
+    dataAvailablePromiseCb()
   };
 
   const recorderStop = new Promise(resolve => {
@@ -39,7 +47,7 @@ async function recordCanvas(
   let last = false;
   let numFrames = 0;
 
-  recorder.start();
+  recorder.start(1000 / fps / 2);
 
   // initial delay needed to capture first frame
   await new Promise(requestAnimationFrame);
@@ -54,7 +62,12 @@ async function recordCanvas(
     }
 
     // wait for frame to appear on the screen
-    await new Promise(requestAnimationFrame);
+    // await new Promise(requestAnimationFrame);
+    await Promise.race([dataAvailablePromise, new Promise(resolve => setTimeout(resolve, 500))]);
+
+    dataAvailablePromise = new Promise(resolve => {
+      dataAvailablePromiseCb = resolve
+    })
   }
   // final delay needed to capture last few frames
   await new Promise(resolve => setTimeout(resolve, 1000));
@@ -63,15 +76,22 @@ async function recordCanvas(
 
   await recorderStop;
 
-  const newChunks = await fixFPS(
-    await readBlob(new Blob(chunks)),
-    fps,
-    numFrames
-  );
+  try {
+    const buffer = await readBlob(new Blob(chunks))
+    const newChunks = await fixFPS(
+      buffer,
+      fps,
+      numFrames
+    );
 
-  const out = new Blob(newChunks, { type: mediaType });
+    const out = new Blob(newChunks, { type: mediaType });
 
-  return out;
+    return out;
+  } catch (err) {
+    console.error(err)
+    alert(`Failed to fix FPS! The recording was probably too big.\n\n${err.name}: ${err.message}`)
+    return new Blob(chunks, { type: mediaType })
+  }
 }
 
 // prettier-ignore
@@ -189,8 +209,9 @@ async function readBlob(blob) {
   const reader = new FileReader();
   reader.readAsArrayBuffer(blob);
 
-  await new Promise(resolve => {
+  await new Promise((resolve, reject) => {
     reader.onload = resolve;
+    reader.onerror = e => reject(reader.error);
   });
 
   const result = reader.result;
